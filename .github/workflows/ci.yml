@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Host tests (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C tests
+
+  build:
+    name: Build plugin (VitaSDK)
+    runs-on: ubuntu-24.04
+    container: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build && cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitazoom-skprx
+          path: build/vitazoom.skprx

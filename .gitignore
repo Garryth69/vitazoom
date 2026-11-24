@@ -1,0 +1,6 @@
+build/
+backup/
+tests/vitazoom_tests
+*.skprx
+*.velf
+__pycache__/
