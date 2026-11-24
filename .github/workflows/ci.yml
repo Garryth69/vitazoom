@@ -12,7 +12,7 @@ jobs:
     name: Host tests (ASan + UBSan)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: make -C tests
 
   build:
@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: vitasdk/vitasdk:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: cmake -B build && cmake --build build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: vitazoom-skprx
           path: build/vitazoom.skprx
