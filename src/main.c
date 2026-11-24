@@ -123,6 +123,7 @@ static void switch_app(SceUID pid)
 	snprintf(g_app_tid, sizeof(g_app_tid), "%s", tid);
 	vz_config_load_app(g_app_tid);
 	vz_gesture_reset();
+	vz_content_reset();
 	vz_set_view(0, 0, 0);
 	if (!view_restore(g_app_tid)) {
 		g_armed = g_cfg.auto_arm;
@@ -240,6 +241,12 @@ static int worker(SceSize args, void *argp)
 		stick_pan(&pad, held);
 		vz_view_apply(); /* viewport zoom follows the requested view */
 		vz_snap_poll();
+		/* the picture area changed (black bars found or gone): keep the
+		 * view inside it */
+		if (g_cont_changed) {
+			g_cont_changed = 0;
+			if (g_level > 0) vz_set_view(g_level, g_x0, g_y0);
+		}
 
 		/* show the zoom level while it changes (pinch, stick, double tap) */
 		if (g_armed && !g_menu_open && g_level != osd_level) {
@@ -271,10 +278,11 @@ static int worker(SceSize args, void *argp)
 			last_log = now;
 		} else if ((g_armed || g_menu_open) && now - last_log > 5000000) {
 			log_state("state");
-			vz_log("  touch region=%d hits=%u,%u,%u,%u enable=0x%x | idx0=%u idx1=%u",
+			vz_log("  touch region=%d hits=%u,%u,%u,%u enable=0x%x | idx0=%u idx1=%u | picture %d,%d-%d,%d | restore tries %u",
 			       g_st.touch_region, g_st.region_hits[0], g_st.region_hits[1],
 			       g_st.region_hits[2], g_st.region_hits[3], g_st.touch_enable_ret,
-			       g_st.idx_calls[0], g_st.idx_calls[1]);
+			       g_st.idx_calls[0], g_st.idx_calls[1], g_cont_x0, g_cont_y0, g_cont_x1, g_cont_y1,
+			       g_st.restore_tries);
 			last_log = now;
 		}
 

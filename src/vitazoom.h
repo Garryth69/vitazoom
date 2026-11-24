@@ -8,7 +8,7 @@
 #include <psp2kern/types.h>
 #include <stdint.h>
 
-#define VZ_VERSION "1.0.0-beta.1" /* SemVer, see README */
+#define VZ_VERSION "1.0.0-beta.2" /* SemVer, see README */
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -30,6 +30,7 @@ extern volatile uint32_t g_lvl_bad; /* bit per level refused by the display */
 enum { TOUCH_BLOCK, TOUCH_PASS };             /* touch_mode */
 enum { STICK_OFF, STICK_RIGHT, STICK_L_RIGHT }; /* pan_stick */
 enum { PINCH_SOFT, PINCH_NORMAL, PINCH_STRONG }; /* pinch */
+enum { REAR_APP, REAR_BLOCK, REAR_ZOOM };       /* rear_mode */
 
 typedef struct {
 	/* global only */
@@ -40,10 +41,10 @@ typedef struct {
 	int auto_arm;           /* arm zoom when this app comes to the foreground */
 	int touch_mode;         /* 1 finger: blocked, or passed corrected by zoom */
 	int pan_stick;          /* move the zoomed area with the right stick */
-	int dtap_enable;        /* double tap resets to 1x */
-	int hold_step;          /* zoom per long-press step, x100 (125/150/200) */
+	int dtap_enable;        /* double tap: zoom in at 1x, back to 1x when zoomed */
+	int dtap_zoom;          /* double tap zoom factor x100 (150..300) */
 	int pinch;              /* pinch strength: PINCH_SOFT/NORMAL/STRONG */
-	int block_rear;         /* also hide rear touch from the app while armed */
+	int rear_mode;          /* rear touch while armed: REAR_APP/BLOCK/ZOOM */
 	int view_w, view_x, view_y; /* saved view (crop width, 0 = none) */
 } vz_config_t;
 
@@ -94,6 +95,10 @@ void vz_level_name(int level, char *buf, int len);
 int vz_lvl_documented(int level);      /* always accepted by the display */
 void vz_set_view(int level, int x0, int y0);
 void vz_view_apply(void);             /* worker: push the view to the display */
+/* picture area (black bars excluded) that the view is kept inside */
+extern volatile int g_cont_x0, g_cont_y0, g_cont_x1, g_cont_y1, g_cont_changed;
+void vz_content_reset(void);
+void vz_content_sample(int fb_w, int fb_h, int x0, int y0, int x1, int y1);
 extern volatile int g_vp_mode, g_vp_active, g_vp_ret;
 /* Own frame for the menu on screens the app rewrites without presenting
  * (Adrenaline "Original"): allocated only while the menu is open. */
@@ -117,7 +122,8 @@ typedef struct {
 void vz_gesture_reset(void);
 /* Arbitrated entry point for every touch sample source. Only samples from the
  * foreground process and newer than the last one are used. */
-void vz_touch_sample(SceUID pid, uint64_t ts, int n, const int16_t *xy, int stride);
+/* port 0 = front, 1 = rear (used only with REAR_ZOOM); xy in panel units */
+void vz_touch_sample(SceUID pid, int port, uint64_t ts, int n, const int16_t *xy, int stride);
 
 /* touch sample as returned by SceTouch (user and kernel APIs) */
 typedef struct {
@@ -147,8 +153,9 @@ typedef struct {
 	uint32_t resubmits;
 	uint32_t idx_calls[2];         /* setfb calls per framebuffer index */
 	int touch_enable_ret;
-	int touch_region;              /* -1 = plain touch read */
+	int touch_region;              /* -1 = plain touch read, 4 = all regions merged */
 	uint32_t region_hits[4];
+	uint32_t restore_tries;        /* re-presents until the app frame was back */
 	int stick_rx, stick_ry;
 	int ctrl_k_hooks, ctrl_u_hooks, touch_k_hooks, touch_u_hooks, vblank_hooks;
 } vz_stats_t;

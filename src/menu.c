@@ -23,9 +23,9 @@ static const char *const item_label[IT_COUNT] = {
 	"One-finger touch",
 	"Move with analog stick",
 	"Pinch strength",
-	"Double tap resets zoom",
-	"Long-press zoom step",
-	"Block rear touch",
+	"Double tap zoom",
+	"Double-tap zoom level",
+	"Rear touch",
 	"Menu shortcut",
 	"Quick zoom shortcut",
 	"Save for this app",
@@ -39,7 +39,7 @@ static const char *const item_label[IT_COUNT] = {
 
 static int sel;
 static int capture;          /* 0 = no, else item being captured */
-static uint32_t cap_btn, cap_t;
+static uint32_t cap_btn, cap_t, cap_start;
 static int cap_released;
 static uint32_t rep_btn, rep_t;
 static char status[64];
@@ -139,9 +139,12 @@ static int item_value(int i, char *val, int vlen, int zok)
 		break;
 	case IT_DTAP_LVL:
 		if (g_cfg.touch_mode == TOUCH_PASS) { snprintf(val, vlen, "-"); vfg = FG_DIM; }
-		else snprintf(val, vlen, "+%d%%", g_cfg.hold_step - 100);
+		else snprintf(val, vlen, "%d.%dx", g_cfg.dtap_zoom / 100, g_cfg.dtap_zoom % 100 / 10);
 		break;
-	case IT_REAR: snprintf(val, vlen, g_cfg.block_rear ? "yes" : "no"); break;
+	case IT_REAR:
+		snprintf(val, vlen, g_cfg.rear_mode == REAR_ZOOM ? "zoom gestures" :
+		         g_cfg.rear_mode == REAR_BLOCK ? "blocked" : "to the app");
+		break;
 	case IT_MENU_COMBO:
 	case IT_TOGGLE_COMBO:
 		if (capture == i) {
@@ -214,7 +217,7 @@ void vz_menu_render(void)
 
 	y += 38;
 	if (capture)
-		vz_text_big(20, y, "Hold the button combination for 1 second", FG_ACCENT);
+		vz_text_big(20, y, "Hold the new combination 1 s, CIRCLE: cancel", FG_ACCENT);
 	else if (g_zoom_fail)
 		vz_text_big(20, y, "Warning: the display refused the crop", FG_WARN);
 	else if (status[0])
@@ -225,10 +228,12 @@ void vz_menu_render(void)
 		vz_text_big(20, y, "TRIANGLE removes the quick shortcut", FG_DIM);
 	else if (sel == IT_TOUCH)
 		vz_text_big(20, y, "\"to the app\": zoom with 2 fingers only", FG_DIM);
+	else if (sel == IT_REAR)
+		vz_text_big(20, y, "Zoom gestures: drag, pinch, double tap", FG_DIM);
 	else if (sel == IT_PINCH)
 		vz_text_big(20, y, "How much zoom each pinch makes", FG_DIM);
 	else if (sel == IT_DTAP_LVL)
-		vz_text_big(20, y, "Hold 1 finger: one more step per second", FG_DIM);
+		vz_text_big(20, y, "Double tap: zoom in, again: normal size", FG_DIM);
 	else if (sel == IT_SAVE_APP)
 		vz_text_big(20, y, "Also stores the current zoom as the start", FG_DIM);
 
@@ -263,7 +268,7 @@ static void render_compact(void)
 	}
 	y += 3;
 	if (status[0]) vz_text_small(8, y, status, status_fg);
-	else if (capture) vz_text_small(8, y, "Hold the combination for 1 s", FG_ACCENT);
+	else if (capture) vz_text_small(8, y, "Hold new combination 1 s, CIRCLE: cancel", FG_ACCENT);
 	vz_text_small(8, h - 16, "X select  LEFT/RIGHT change  CIRCLE close", FG_DIM);
 	vz_dl_commit();
 }
@@ -305,13 +310,12 @@ static void change(int item, int dir)
 	case IT_TOUCH: g_cfg.touch_mode = g_cfg.touch_mode == TOUCH_PASS ? TOUCH_BLOCK : TOUCH_PASS; break;
 	case IT_STICK: g_cfg.pan_stick = (g_cfg.pan_stick + 3 + dir) % 3; break;
 	case IT_DTAP: g_cfg.dtap_enable = !g_cfg.dtap_enable; break;
-	case IT_REAR: g_cfg.block_rear = !g_cfg.block_rear; break;
-	case IT_DTAP_LVL: { /* +25%, +50%, +100% per step */
-		static const int steps[3] = {125, 150, 200};
-		int i = g_cfg.hold_step == 125 ? 0 : g_cfg.hold_step == 200 ? 2 : 1;
-		g_cfg.hold_step = steps[(i + 3 + dir) % 3];
+	case IT_REAR: g_cfg.rear_mode = (g_cfg.rear_mode + 3 + dir) % 3; break;
+	case IT_DTAP_LVL: /* 1.5x, 2x, 2.5x, 3x */
+		g_cfg.dtap_zoom += dir * 50;
+		if (g_cfg.dtap_zoom > 300) g_cfg.dtap_zoom = 150;
+		if (g_cfg.dtap_zoom < 150) g_cfg.dtap_zoom = 300;
 		break;
-	}
 	}
 }
 
@@ -323,7 +327,7 @@ static void activate(int item, uint32_t now)
 		capture = item;
 		cap_released = 0;
 		cap_btn = 0;
-		cap_t = now;
+		cap_t = cap_start = now;
 		break;
 	case IT_SAVE_APP:
 		if (!g_app_tid[0]) { set_status(FG_WARN, "Unknown app"); break; }
@@ -350,6 +354,12 @@ static void activate(int item, uint32_t now)
 static void capture_input(uint32_t held, uint32_t now)
 {
 	held &= ~SCE_CTRL_PSBUTTON;
+	/* never a trap: CIRCLE alone cancels, and so does waiting 8 s */
+	if ((cap_released && held == SCE_CTRL_CIRCLE) || now - cap_start > 8000000) {
+		capture = 0;
+		set_status(FG_DIM, "Shortcut not changed.");
+		return;
+	}
 	if (!cap_released) {
 		if (!held) cap_released = 1;
 		return;

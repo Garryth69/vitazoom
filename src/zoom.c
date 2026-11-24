@@ -42,6 +42,9 @@ typedef struct {
 	unsigned int x, y, width, height;
 } vz_viewport_t;
 int ksceDisplaySetViewportConf(int head, int fb_idx, const vz_viewport_t *conf);
+/* what the display will show for a slot of the calling process (0x1C bytes) */
+typedef struct { SceDisplayFrameBuf fb; uint32_t extra; } vz_fbext_t;
+int ksceDisplayGetFrameBufInternal(int head, int fb_idx, vz_fbext_t *fb, int sync);
 
 /* SceTouchForDriver (not declared in the SDK headers) */
 int ksceTouchPeek(uint32_t port, vz_tdata_t *data, uint32_t nbufs);
@@ -64,7 +67,7 @@ volatile int g_redraw = 0;
 volatile int g_vp_mode = 1;   /* 1 = use the viewport while it works */
 volatile int g_vp_active = 0; /* a viewport is currently applied */
 volatile int g_vp_ret = 0;    /* last result */
-static int vp_slot = -1, vp_level = -1, vp_x = -1, vp_y = -1, vp_fbw, vp_fbh;
+static int vp_slot = -1;
 
 static tai_hook_ref_t ref_setfb;
 static SceUID hook_setfb = -1;
@@ -91,6 +94,7 @@ static SceUID snap_uid = -1;
 static uint32_t *snap_base;
 static volatile int snap_need_capture, snap_shown, snap_index = -1, snap_busy;
 static volatile SceUID snap_pid = -1; /* app whose display shows our frame */
+static int fbq_ok; /* 1 = the display can be asked what it shows */
 static volatile uint32_t snap_gen_drawn, snap_off_t;
 static volatile int snap_refused_ret; /* logged by the worker, not in the hook */
 static int snap_type_first; /* 1 = main RAM was refused by the display: use CDRAM */
@@ -224,77 +228,117 @@ static int snap_present(int head, int index, int sync)
 	return ret;
 }
 
-/* ---- viewport zoom (called by the worker every tick) ---- */
+/* ---- viewport zoom (called by the worker every tick) ----
+ * The viewport glides to the requested view: each tick it covers half of the
+ * remaining distance, in 1/16 screen pixel steps, so dragging, pinching and
+ * zooming in or out look smooth on any framebuffer size. The menu never
+ * waits for it: zoom is dropped at once when the menu shows up. */
+
+#define VP_FULL_W (SCREEN_W * 16)
+#define VP_FULL_H (SCREEN_H * 16)
+static int vp_cur[4] = {0, 0, VP_FULL_W, VP_FULL_H}; /* x, y, w, h in 1/16 px */
+static int vp_sent[4];
 
 static void vp_reset(void)
 {
 	if (vp_slot >= 0)
 		ksceDisplaySetViewportConf(0, vp_slot, NULL);
-	vp_slot = vp_level = vp_x = vp_y = -1;
+	vp_slot = -1;
 	g_vp_active = 0;
+	vp_cur[0] = vp_cur[1] = 0;
+	vp_cur[2] = VP_FULL_W;
+	vp_cur[3] = VP_FULL_H;
+}
+
+static int vp_send(int slot, const int *v)
+{
+	vz_viewport_t vp;
+	vp.size = sizeof(vp);
+	vp.x = (unsigned)((v[0] + 8) / 16);
+	vp.y = (unsigned)((v[1] + 8) / 16);
+	vp.width = (unsigned)((v[2] + 8) / 16);
+	vp.height = (unsigned)((v[3] + 8) / 16);
+	if (vp.x > SCREEN_W - 320) vp.x = SCREEN_W - 320; /* x <= 640, y <= 364 */
+	if (vp.y > SCREEN_H - 180) vp.y = SCREEN_H - 180;
+	if (vp.x + vp.width > SCREEN_W) vp.width = SCREEN_W - vp.x;
+	if (vp.y + vp.height > SCREEN_H) vp.height = SCREEN_H - vp.y;
+	int ret = ksceDisplaySetViewportConf(0, slot, &vp);
+	g_vp_ret = ret;
+	return ret;
 }
 
 void vz_view_apply(void)
 {
-	/* only on the app the zoom belongs to (not on the LiveArea or the next
-	 * app while the switch is being confirmed) */
-	int want = g_vp_mode && g_armed && !g_menu_open && g_level > 0 &&
-	           g_fb_w > 0 && g_fb_h > 0 && g_fg_pid == g_app_pid &&
-	           !vz_snap_visible(); /* never zoom our own menu frame */
 	int slot = g_st.fb_idx & 1;
-	if (!want) {
+	/* never on the menu, our own frame, or another app (LiveArea, or the next
+	 * app while the switch is being confirmed): drop it at once */
+	if (!g_vp_mode || g_menu_open || vz_snap_visible() || g_fg_pid != g_app_pid ||
+	    g_fb_w <= 0 || g_fb_h <= 0) {
 		if (g_vp_active) { vp_reset(); g_shown_level = 0; g_redraw = 1; }
 		return;
 	}
+	int want = g_armed && g_level > 0;
+	if (!g_vp_active && !want) return;
+	if (g_vp_active && slot != vp_slot) vp_reset();
+	if (!g_vp_active) { /* zooming in starts from the full screen */
+		vp_cur[0] = vp_cur[1] = 0;
+		vp_cur[2] = VP_FULL_W;
+		vp_cur[3] = VP_FULL_H;
+	}
+
 	int level = g_level, x0 = g_x0, y0 = g_y0;
-	/* nothing changed: still re-sent once a second, so the zoom comes back by
-	 * itself if the display was reset (suspend/resume, app video mode change) */
+	int t[4] = {0, 0, VP_FULL_W, VP_FULL_H}; /* zooming out: back to full */
+	if (want) {
+		t[0] = x0 * VP_FULL_W / g_fb_w;
+		t[1] = y0 * VP_FULL_H / g_fb_h;
+		t[2] = vz_crop_w(level) * VP_FULL_W / g_fb_w;
+		t[3] = vz_crop_h(level) * VP_FULL_H / g_fb_h;
+	}
+	for (int k = 0; k < 4; k++) {
+		int d = t[k] - vp_cur[k];
+		vp_cur[k] = (d > -16 && d < 16) ? t[k] : vp_cur[k] + d / 2;
+	}
+	if (!want && vp_cur[0] == 0 && vp_cur[1] == 0 &&
+	    vp_cur[2] == VP_FULL_W && vp_cur[3] == VP_FULL_H) {
+		vp_reset(); /* fully zoomed out */
+		g_shown_level = 0;
+		g_redraw = 1;
+		return;
+	}
+
+	/* unchanged: still re-sent once a second, so the zoom comes back by
+	 * itself if the display was reset (suspend/resume, app video mode) */
 	static uint32_t sent_t;
 	uint32_t now = ksceKernelGetSystemTimeLow();
-	if (g_vp_active && slot == vp_slot && level == vp_level && x0 == vp_x && y0 == vp_y &&
-	    g_fb_w == vp_fbw && g_fb_h == vp_fbh && now - sent_t < 1000000)
+	if (g_vp_active && !memcmp(vp_cur, vp_sent, sizeof(vp_cur)) && now - sent_t < 1000000)
 		return;
-	sent_t = now;
-	if (g_vp_active && slot != vp_slot) vp_reset();
-
-	for (int tries = 0; tries < VZ_LEVELS; tries++) {
-		int w = vz_crop_w(level), h = vz_crop_h(level);
-		vz_viewport_t vp;
-		vp.size = sizeof(vp);
-		vp.x = (unsigned)(x0 * SCREEN_W / g_fb_w);
-		vp.y = (unsigned)(y0 * SCREEN_H / g_fb_h);
-		vp.width = (unsigned)(w * SCREEN_W / g_fb_w);
-		vp.height = (unsigned)(h * SCREEN_H / g_fb_h);
-		int ret = ksceDisplaySetViewportConf(0, slot, &vp);
-		g_vp_ret = ret;
-		if (ret >= 0) {
-			vp_slot = slot; vp_level = level; vp_x = x0; vp_y = y0;
-			vp_fbw = g_fb_w; vp_fbh = g_fb_h;
-			g_vp_active = 1;
-			g_shown_level = level;
-			g_shown_x = x0;
-			g_shown_y = y0;
-			g_zoom_fail = 0;
-			g_redraw = 1;
-			return;
-		}
-		if (vz_lvl_documented(level)) {
-			/* even a plain size is refused: no viewport here, use the crop */
-			vz_log("viewport refused (0x%08x) at %ux%u+%u+%u: using the crop",
-			       ret, vp.width, vp.height, vp.x, vp.y);
-			g_vp_mode = 0;
-			vp_reset();
-			return;
-		}
-		/* refused size: drop this level, try the nearest one */
-		g_lvl_bad |= 1u << level;
-		level = vz_level_for_width(vz_lvl_w[level]);
-		if (level <= 0) break;
-		g_level = level;
-		vz_set_view(level, x0, y0);
-		x0 = g_x0; y0 = g_y0;
+	int ret = vp_send(slot, vp_cur);
+	if (ret < 0 && want) {
+		/* an in-between size was refused: jump to the requested one */
+		memcpy(vp_cur, t, sizeof(t));
+		ret = vp_send(slot, vp_cur);
 	}
-	vp_reset();
+	if (ret >= 0) {
+		memcpy(vp_sent, vp_cur, sizeof(vp_cur));
+		sent_t = now;
+		vp_slot = slot;
+		g_vp_active = 1;
+		g_shown_level = want ? level : 0;
+		g_shown_x = want ? x0 : 0;
+		g_shown_y = want ? y0 : 0;
+		g_zoom_fail = 0;
+		return;
+	}
+	if (!want || vz_lvl_documented(level)) {
+		/* even a plain size is refused: no viewport here, use the crop */
+		vz_log("viewport refused (0x%08x): using the crop", ret);
+		g_vp_mode = 0;
+		vp_reset();
+		return;
+	}
+	/* refused size: drop this level and use the nearest one next tick */
+	g_lvl_bad |= 1u << level;
+	vz_set_view(vz_level_for_width(vz_lvl_w[level]), x0, y0);
 }
 
 /* ---- display hook ---- */
@@ -307,60 +351,125 @@ static int zoomable(const SceDisplayFrameBuf *p)
 	       (int)p->height > vz_lvl_h[VZ_LEVELS - 1];
 }
 
-static void sample_touch_here(SceUID pid)
+/* One panel read in the app's context. Some apps (the PSP emulator) get
+ * touch only through touch regions, each reporting just the fingers inside
+ * it: once the plain read stays empty while regions report fingers, every
+ * region is read and the fingers are merged, so the whole panel works and a
+ * pinch across two regions stays a pinch. */
+static int read_panel(int port, vz_tdata_t *td, int regions)
 {
-	if (sampling_pid != pid) {
-		/* make sure the panel is sampled for this process */
-		g_st.ctx_samp = ksceTouchSetSamplingState(0, 1);
-		sampling_pid = pid;
-	}
-	/* Some apps (e.g. Adrenaline) get touch only through touch regions:
-	 * when the plain read stays empty, probe regions 0..3 in turn and stick
-	 * with one that reports fingers. */
-	static int probe, empty_frames;
-	static SceUID enabled_pid = -1, empty_pid = -1;
-	if (empty_pid != pid) { empty_pid = pid; empty_frames = 0; }
-	vz_tdata_t td;
-	td.reportNum = 0;
-	g_self_peek_thid = ksceKernelGetThreadId();
-	int ret, region = g_st.touch_region;
-	if (region >= 0) {
-		ret = ksceTouchPeekRegion(0, &td, 1, region);
-	} else {
-		ret = ksceTouchPeek(0, &td, 1);
-		if (ret >= 0 && td.reportNum == 0 && ++empty_frames > 30) {
-			/* the panel may be disabled for this app: enable it once. Never in the
-			 * PSP emulator: it keeps its panel off on purpose, and changing the
-			 * emulator's state from here is not ours to do */
-			if (empty_frames == 31 && enabled_pid != pid && pid != g_pspemu_pid) {
-				g_st.touch_enable_ret = ksceTouchSetEnableFlag(0, 1);
-				enabled_pid = pid;
-			}
-			vz_tdata_t tr;
-			tr.reportNum = 0;
-			int r = probe++ & 3;
-			int rr = ksceTouchPeekRegion(0, &tr, 1, r);
-			if (rr > 0 && tr.reportNum > 0) {
-				g_st.region_hits[r]++;
-				if (g_st.region_hits[r] >= 3) g_st.touch_region = r;
-				td = tr;
-				ret = rr;
-			}
-		} else if (td.reportNum > 0) {
-			empty_frames = 0;
+	td->reportNum = 0;
+	td->timeStamp = 0;
+	if (!regions)
+		return ksceTouchPeek(port, td, 1);
+	int ok = -1;
+	for (int r = 0; r < 4; r++) {
+		vz_tdata_t tr;
+		tr.reportNum = 0;
+		if (ksceTouchPeekRegion(port, &tr, 1, r) <= 0) continue;
+		ok = 1;
+		if (tr.timeStamp > td->timeStamp) td->timeStamp = tr.timeStamp;
+		for (uint32_t i = 0; i < tr.reportNum && i < 8; i++) {
+			uint32_t k;
+			for (k = 0; k < td->reportNum; k++)
+				if (td->report[k].id == tr.report[i].id) break;
+			if (k == td->reportNum && td->reportNum < 8)
+				td->report[td->reportNum++] = tr.report[i];
 		}
+		if (tr.reportNum) g_st.region_hits[r]++;
 	}
-	g_self_peek_thid = -1;
-	g_st.ctx_ret = ret;
-	if (ret <= 0) return;
-	int n = td.reportNum > 2 ? 2 : (int)td.reportNum;
-	g_st.ctx_n = n;
+	return ok;
+}
+
+static void feed_panel(SceUID pid, int port, const vz_tdata_t *td)
+{
+	int n = td->reportNum > 2 ? 2 : (int)td->reportNum;
 	int16_t xy[4];
 	for (int i = 0; i < n; i++) {
-		xy[i * 2] = td.report[i].x;
-		xy[i * 2 + 1] = td.report[i].y;
+		xy[i * 2] = td->report[i].x;
+		xy[i * 2 + 1] = td->report[i].y;
 	}
-	vz_touch_sample(pid, td.timeStamp, n, xy, 2);
+	if (port == 0) g_st.ctx_n = n;
+	vz_touch_sample(pid, port, td->timeStamp, n, xy, 2);
+}
+
+static void sample_touch_here(SceUID pid)
+{
+	static SceUID enabled_pid = -1, mode_pid = -1;
+	static int empty_frames, probe_t;
+	if (sampling_pid != pid) {
+		/* make sure the panels are sampled for this process */
+		g_st.ctx_samp = ksceTouchSetSamplingState(0, 1);
+		ksceTouchSetSamplingState(1, 1);
+		sampling_pid = pid;
+	}
+	if (mode_pid != pid) { mode_pid = pid; empty_frames = 0; g_st.touch_region = -1; }
+	int regions = g_st.touch_region >= 0;
+
+	g_self_peek_thid = ksceKernelGetThreadId();
+	vz_tdata_t td;
+	int ret = read_panel(0, &td, regions);
+	if (!regions && ret >= 0 && td.reportNum == 0 && ++empty_frames > 30) {
+		/* the panel may be disabled for this app: enable it once. Never in
+		 * the PSP emulator: it keeps its panel off on purpose */
+		if (empty_frames == 31 && enabled_pid != pid && pid != g_pspemu_pid) {
+			g_st.touch_enable_ret = ksceTouchSetEnableFlag(0, 1);
+			enabled_pid = pid;
+		}
+		/* look at the regions now and then (a finger is needed to tell) */
+		if (++probe_t % 4 == 0) {
+			vz_tdata_t tr;
+			if (read_panel(0, &tr, 1) > 0 && tr.reportNum > 0) {
+				g_st.touch_region = 4; /* all regions, merged */
+				td = tr;
+				ret = 1;
+			}
+		}
+	} else if (td.reportNum > 0) {
+		empty_frames = 0;
+	}
+	g_st.ctx_ret = ret;
+	if (ret > 0) feed_panel(pid, 0, &td);
+	if (g_cfg.rear_mode == REAR_ZOOM && read_panel(1, &td, g_st.touch_region >= 0) > 0)
+		feed_panel(pid, 1, &td);
+	g_self_peek_thid = -1;
+}
+
+/* ---- picture area (black bars) ----
+ * App context, at most twice a second while zoom is on: every 8th row of the
+ * frame is checked for its first and last non-black pixel. */
+static uint32_t scan_row[SCREEN_W];
+
+static int is_black(uint32_t c)
+{
+	return (c & 0xFF) < 24 && ((c >> 8) & 0xFF) < 24 && ((c >> 16) & 0xFF) < 24;
+}
+
+static void scan_content(const SceDisplayFrameBuf *fb)
+{
+	static uint32_t last_t;
+	uint32_t now = ksceKernelGetSystemTimeLow();
+	if (now - last_t < 500000) return;
+	last_t = now;
+	int w = fb->width, h = fb->height;
+	if (fb->pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 || w > SCREEN_W || w <= 0 ||
+	    h <= 0 || fb->pitch < fb->width)
+		return;
+	int x0 = w, x1 = 0, y0 = h, y1 = 0;
+	for (int y = 4; y < h; y += 8) {
+		if (ksceKernelCopyFromUser(scan_row, (const uint32_t *)fb->base + y * fb->pitch, w * 4) < 0)
+			return;
+		int l = 0;
+		while (l < w && is_black(scan_row[l])) l++;
+		if (l == w) continue;
+		int r = w - 1;
+		while (r > l && is_black(scan_row[r])) r--;
+		if (l < x0) x0 = l;
+		if (r + 1 > x1) x1 = r + 1;
+		if (y - 4 < y0) y0 = y - 4;
+		if (y + 4 > y1) y1 = y + 4;
+	}
+	vz_content_sample(w, h, x0, y0, x1, y1);
 }
 
 /* aligned x for the crop, with hysteresis so the view doesn't flicker
@@ -401,6 +510,7 @@ static int setfb_hook(int head, int index, const SceDisplayFrameBuf *p, int sync
 		g_fb_w = p->width;
 		g_fb_h = p->height;
 		g_lvl_bad = 0;
+		vz_content_reset();
 		vz_set_view(g_level, g_x0, g_y0); /* re-validate for the new size */
 	}
 	g_st.setfb_calls++;
@@ -426,11 +536,16 @@ static int setfb_hook(int head, int index, const SceDisplayFrameBuf *p, int sync
 		__sync_sub_and_fetch(&snap_busy, 1);
 		return r;
 	}
-	if (snap_shown && index == snap_index && p->base != snap_base)
-		snap_shown = 0; /* the display is back on an app frame */
+	/* the display is back on an app frame: always when the app presents by
+	 * itself; for our re-presents, only if the display can't be asked */
+	if (snap_shown && index == snap_index && p->base != snap_base &&
+	    (ksceKernelGetThreadId() != resubmit_thid || !fbq_ok))
+		snap_shown = 0;
 
-	if (g_armed && !g_menu_open)
+	if (g_armed && !g_menu_open) {
 		sample_touch_here(pid);
+		scan_content(p);
+	}
 
 	/* Overlay: the menu over the full frame; the OSD only on frames the app
 	 * presents itself (it redraws them, so the OSD disappears with it; on a
@@ -520,6 +635,7 @@ static void maybe_resubmit(void)
 	if (g_armed && !g_menu_open && now - last_sample_t > 10000) {
 		last_sample_t = now;
 		sample_touch_here(pid);
+		scan_content(&last_fb);
 	}
 	/* The PSP emulator presents its own frames (and its "Original" mode scans the
 	 * PSP display out without presenting): a frame of ours from one of its threads
@@ -531,6 +647,20 @@ static void maybe_resubmit(void)
 	/* menu closed but our frame is still on screen: the app's frame must come
 	 * back (the emulator in "Original" never presents again by itself) */
 	int restore = !g_snap_on && snap_shown;
+	if (restore && snap_pid == pid) {
+		/* ask the display what it shows: done once it is no longer our frame */
+		vz_fbext_t cur;
+		memset(&cur, 0, sizeof(cur));
+		cur.fb.size = sizeof(cur);
+		if (ksceDisplayGetFrameBufInternal(last_head, snap_index, &cur, 1) >= 0) {
+			fbq_ok = 1;
+			if (cur.fb.base != snap_base) {
+				snap_shown = 0;
+				return;
+			}
+			g_st.restore_tries++;
+		}
+	}
 	if (g_snap_on) {
 		/* our frame stays on screen by itself: present only when it changed */
 		if (snap_shown && !snap_need_capture && g_menu_gen == snap_gen_drawn) return;

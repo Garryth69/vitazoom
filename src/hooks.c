@@ -129,14 +129,14 @@ volatile SceUID g_self_peek_thid = -1;
 
 static void feed(uint32_t port, const vz_tdata_t *k)
 {
-	if (port != 0 || !g_armed || g_menu_open) return;
+	if (port > 1 || !g_armed || g_menu_open) return;
 	int16_t xy[4];
 	int n = k->reportNum > 2 ? 2 : (int)k->reportNum;
 	for (int i = 0; i < n; i++) {
 		xy[i * 2] = k->report[i].x;
 		xy[i * 2 + 1] = k->report[i].y;
 	}
-	vz_touch_sample(ksceKernelGetProcessId(), k->timeStamp, n, xy, 2);
+	vz_touch_sample(ksceKernelGetProcessId(), (int)port, k->timeStamp, n, xy, 2);
 }
 
 /* Decide what the app gets for one buffer. Returns 1 if *k was changed. */
@@ -145,7 +145,7 @@ static int filter_one(uint32_t port, vz_tdata_t *k)
 	if (g_menu_open) goto block;
 	if (!g_armed) return 0;
 	if (port == 1) {
-		if (g_cfg.block_rear) goto block;
+		if (g_cfg.rear_mode != REAR_APP) goto block; /* blocked, or ours */
 		return 0;
 	}
 	if (port != 0) return 0;

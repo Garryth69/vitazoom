@@ -2,13 +2,14 @@
 
 > **Beta.** It works, but it is still being tested. Use it at your own risk and report problems in *Issues*.
 
-A taiHEN kernel plugin for PS Vita that lets you zoom into the screen **while playing**, with pinch, long press or the right stick, while the buttons keep working normally.
+A taiHEN kernel plugin for PS Vita that lets you zoom into the screen **while playing**, with pinch, double tap or the right stick, while the buttons keep working normally.
 
 ## Features
 - Zoom on top of any app or game, including Adrenaline (with any "Graphics Filtering" setting).
 - **No FPS cost:** it uses the display controller *viewport*, the same mechanism as the system Accessibility zoom. The hardware scales the image.
-- Smooth zoom on both axes, in fine steps (about 4.6% each), up to 3x the screen.
-- Pinch, long press, drag, double tap to reset, and right-stick panning.
+- Smooth zoom on both axes: the view glides to every new position in sub-pixel steps, in fine zoom steps (about 4.6% each), up to 3x the screen.
+- Pinch, drag and double tap on the front panel, optionally on the rear panel too, and right-stick panning.
+- The view stays inside the picture: black bars around a 4:3 picture (PS1 games, emulators) never fill the screen.
 - Overlay menu with global settings and **per-app profiles**.
 
 ## Compatibility
@@ -33,9 +34,9 @@ A taiHEN kernel plugin for PS Vita that lets you zoom into the screen **while pl
 - In the menu, set **Zoom: ON** and close it.
 - While zoom is on, front touch no longer reaches the game and is used for zooming:
   - **Two-finger pinch:** zooms in or out. The point between the fingers stays fixed, and moving both fingers also pans.
-  - **Hold one finger still:** after 0.5 s the zoom goes up one step, keeping the point under the finger fixed. Keep holding for one more step per second, up to the maximum. After holding, sliding the finger pans the zoomed area.
   - **One-finger drag:** pans the zoomed area.
-  - **Double tap:** back to the normal screen.
+  - **Double tap:** at normal size, zooms in on the tapped point (2x by default); while zoomed, goes back to the normal screen.
+  - **Rear panel** (optional, see "Rear touch"): the same drag, pinch and double tap from the back of the console, so your fingers do not cover the screen.
 - To give touch back to the game, turn zoom off in the menu or with the quick shortcut.
 
 ### Menu items
@@ -46,18 +47,18 @@ A taiHEN kernel plugin for PS Vita that lets you zoom into the screen **while pl
 | One-finger touch | **zoom only:** touch does not reach the app. **to the app:** one finger goes to the app, with its position corrected for the zoom, and zooming uses two fingers *(per app)* |
 | Move with analog stick | Pans with the right stick, always or only while holding L. While it pans, the game does not get the right stick *(per app)* |
 | Pinch strength | How much zoom each pinch makes: soft (half), normal or strong (double) *(per app)* |
-| Double tap resets zoom | Enables the double tap that goes back to 1x *(per app)* |
-| Long-press zoom step | How much each long-press step zooms: +25%, +50% or +100% *(per app)* |
-| Block rear touch | Also hides rear touch from the app while zoom is on *(per app)* |
-| Menu shortcut | Press X, then hold the new combination for 1 s (at least 2 buttons) |
+| Double tap zoom | Enables the double tap: zoom in at normal size, back to normal when zoomed *(per app)* |
+| Double-tap zoom level | How much the double tap zooms in: 1.5x, 2x, 2.5x or 3x *(per app)* |
+| Rear touch | While zoom is on: **to the app** (unchanged), **blocked** (hidden from the app) or **zoom gestures** (drag, pinch and double tap on the rear panel, hidden from the app) *(per app)* |
+| Menu shortcut | Press X, then hold the new combination for 1 s (at least 2 buttons). CIRCLE alone cancels, and so does waiting 8 s |
 | Quick zoom shortcut | Turns zoom on and off without the menu. TRIANGLE removes it |
 | Save for this app | Saves the app profile, including the current zoom as its starting zoom |
 | Save as default (all apps) | Saves the settings used by apps without a profile |
 | Use default for this app | Deletes the app profile |
 
-Long press and double tap only work in "zoom only" mode.
+With "One-finger touch: to the app", the front panel zooms with two fingers only (no drag or double tap there); the rear panel is not affected by that setting.
 
-While pinching, long-pressing or using the stick, an indicator shows the current zoom for 1.5 s. In apps that do not present frames by themselves (static screens, Adrenaline with "Original" filtering) the indicator is not shown, since it would stay burned into the picture or flicker.
+While pinching or using the stick, an indicator shows the current zoom for 1.5 s. In apps that do not present frames by themselves (static screens, Adrenaline with "Original" filtering) the indicator is not shown, since it would stay burned into the picture or flicker.
 
 ### Per-app profiles
 Each app (identified by its Title ID, shown at the top of the menu) can have its own profile. When you leave an app and come back, the plugin restores the zoom and position you left it at (up to 8 apps, until the console is turned off). Shortcuts are always global. In Adrenaline, all PSP games share the Adrenaline profile.
@@ -65,6 +66,7 @@ Each app (identified by its Title ID, shown at the top of the menu) can have its
 ### Adrenaline
 - Zoom works with any "Graphics Filtering" setting, including Original.
 - With Original, the screen is the PSP video memory itself (480x272), which the emulator rewrites every frame. While the menu is open, VitaZoom shows its own frame (a dimmed still of the game with the full-size menu), and goes back to the game when it closes.
+- The emulator reads touch through touch regions; VitaZoom reads all of them and merges the fingers, so gestures work on the whole panel.
 - Inside the emulator, VitaZoom does not re-present frames during gameplay (only while its menu is open) and does not change the emulator's touch panel state.
 - Avoid shortcuts that PSP games use (L+R, for example).
 
@@ -78,11 +80,12 @@ Each app (identified by its Title ID, shown at the top of the menu) can have its
 When reporting a problem, attach `log.txt` (or `log.1.txt` if the console froze and was restarted).
 
 ## How it works
-- **Zoom:** the plugin sets the display viewport (`ksceDisplaySetViewportConf`), which magnifies part of whatever is on screen. If the display refuses the viewport, it falls back to handing the display a cropped part of the app's framebuffer (in that mode horizontal panning moves in 64 px steps).
-- **Touch:** Vita touch is only delivered to the focused process, so the plugin reads the panel inside the app's context, in the display hook. Only samples from the focused app that are newer than the previous one are used, which avoids fake touches.
+- **Zoom:** the plugin sets the display viewport (`ksceDisplaySetViewportConf`), which magnifies part of whatever is on screen. The viewport glides to each new position (half of the remaining distance per frame, in 1/16 pixel steps). If the display refuses the viewport, it falls back to handing the display a cropped part of the app's framebuffer (in that mode horizontal panning moves in 64 px steps).
+- **Touch:** Vita touch is only delivered to the focused process, so the plugin reads the panels inside the app's context, in the display hook. Each panel has its own gesture state, and only samples from the focused app that are newer than the previous one are used, which avoids fake touches.
+- **Picture area:** twice a second while zoom is on, every 8th row of the frame is checked for black borders. A bigger picture area is taken at once; a smaller one only after it was seen four times in a row, so a dark scene does not restrict panning by accident.
 - **Static screens:** apps that rarely present a frame are handled from the vblank wait: when something changed, the last frame is presented again.
 - **Menu and indicator:** they use no image buffers; they are lists of rectangles and text (~9 KB), rasterised line by line while being copied to the screen. The exception is the menu's own frame on static screens (2 MB, in main RAM), which only exists while the menu is open.
-- **Stability:** zoom only applies to the app it belongs to, is re-sent every second (so it comes back by itself after sleep), is never applied to the menu, and the menu closes by itself when PS is pressed. Nothing is written to the memory card from inside the video hooks.
+- **Stability:** zoom only applies to the app it belongs to, is re-sent every second (so it comes back by itself after sleep), is never applied to the menu, and the menu closes by itself when PS is pressed. When the menu closes on a static screen, the plugin asks the display which frame it shows and presents the app's frame again until it is back. Nothing is written to the memory card from inside the video hooks.
 
 ## Known limitations
 - Maximum zoom is 3x the screen (a viewport limit). In Adrenaline with Original filtering, up to 2x on top of the 2x the console already applies.
@@ -95,7 +98,7 @@ Requires [VitaSDK](https://vitasdk.org) with taiHEN installed.
 cmake -B build && cmake --build build
 # output: build/vitazoom.skprx
 ```
-Host tests (gesture, zoom levels, settings, menu layout) run with a regular C compiler:
+Host tests (gestures on both panels, zoom levels, picture area, settings, menu layout and rasterising) run with a regular C compiler, with AddressSanitizer and UBSan:
 ```
 make -C tests
 ```

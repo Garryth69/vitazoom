@@ -31,9 +31,9 @@ void vz_config_defaults(void)
 	g_cfg.touch_mode = TOUCH_BLOCK;
 	g_cfg.pan_stick = STICK_OFF;
 	g_cfg.dtap_enable = 1;
-	g_cfg.hold_step = 150;
+	g_cfg.dtap_zoom = 200; /* 2x */
 	g_cfg.pinch = PINCH_NORMAL;
-	g_cfg.block_rear = 0;
+	g_cfg.rear_mode = REAR_APP;
 	g_cfg.view_w = g_cfg.view_x = g_cfg.view_y = 0;
 	g_global = g_cfg;
 }
@@ -66,8 +66,9 @@ static void apply(vz_config_t *c, const char *k, const char *v, int global)
 	else if (!strcmp(k, "touch_mode") && n <= TOUCH_PASS) c->touch_mode = n;
 	else if (!strcmp(k, "pan_stick") && n <= STICK_L_RIGHT) c->pan_stick = n;
 	else if (!strcmp(k, "dtap_enable")) c->dtap_enable = !!n;
-	else if (!strcmp(k, "hold_step") && (n == 125 || n == 150 || n == 200)) c->hold_step = n;
-	else if (!strcmp(k, "block_rear")) c->block_rear = !!n;
+	else if (!strcmp(k, "dtap_zoom") && n >= 150 && n <= 300 && n % 50 == 0) c->dtap_zoom = n;
+	else if (!strcmp(k, "rear_mode") && n <= REAR_ZOOM) c->rear_mode = n;
+	else if (!strcmp(k, "block_rear")) c->rear_mode = n ? REAR_BLOCK : REAR_APP; /* old */
 	else if (!strcmp(k, "pinch") && n <= PINCH_STRONG) c->pinch = n;
 	else if (!strcmp(k, "view_w") && (n == 0 || (n >= 200 && n < 960))) c->view_w = n;
 	else if (!strcmp(k, "view_x") && n < 960) c->view_x = n;
@@ -117,11 +118,11 @@ static int fmt_app_keys(char *buf, int size, const vz_config_t *c)
 		"touch_mode=%d\n"
 		"pan_stick=%d\n"
 		"dtap_enable=%d\n"
-		"hold_step=%d\n"
-		"block_rear=%d\n"
+		"dtap_zoom=%d\n"
+		"rear_mode=%d\n"
 		"pinch=%d\n",
-		c->auto_arm, c->touch_mode, c->pan_stick, c->dtap_enable, c->hold_step,
-		c->block_rear, c->pinch);
+		c->auto_arm, c->touch_mode, c->pan_stick, c->dtap_enable, c->dtap_zoom,
+		c->rear_mode, c->pinch);
 }
 
 static void app_path(char *buf, int len, const char *tid)
